@@ -3,18 +3,17 @@
 // Minimal, intentionally "unoptimized" V4L2 -> ROS2 Image publisher.
 //
 // Design goals (per baseline methodology):
-//   - Use V4L2 mmap capture (not a higher-level camera driver) so every
-//     step is visible and controllable.
-//   - Explicit CPU memcpy from the V4L2 buffer into sensor_msgs::Image.
-//     This copy is intentional: it is exactly the overhead we plan to
-//     measure and later remove with NITROS / zero-copy, so it must stay
-//     until the comparison experiment is done.
-//   - Explicit QoS (SensorDataQoS: best-effort, depth 1) so the transport
-//     policy is a known, fixed variable rather than an implicit default.
-//   - Timestamp taken from the V4L2 buffer's own timestamp field (driver/
-//     hardware supplied) rather than a software timestamp taken after
-//     dequeue, so T0 in later latency breakdowns is as accurate as the
-//     driver allows.
+//   ...
+//   - Timestamp is a SOFTWARE timestamp (RCL_STEADY_TIME), taken
+//     immediately after VIDIOC_DQBUF returns -- NOT the V4L2 buffer's
+//     own buf.timestamp field. On JetPack 6.2, buf.timestamp comes from
+//     the RTCPU coprocessor's own clock domain, and converting it into
+//     the CPU's clock domain requires an offset that has been reported
+//     unreliable by multiple developers (see capture_loop() comments for
+//     detail). This means T0 excludes the fixed hardware capture delay
+//     (exposure+readout+RTCPU+driver notification), but that fixed delay
+//     is present identically across baseline and later NITROS comparison
+//     runs, so it cancels out in the A/B comparison that matters here.
 //
 // This node deliberately does NOT do: DMA-BUF, NvBufSurface, CUDA,
 // NITROS types, or any GPU-side preprocessing. That is the point of a
@@ -45,19 +44,6 @@ struct MmapBuffer
   void * start = nullptr;
   size_t length = 0;
 };
-
-// Convert a V4L2 (kernel) timeval into rclcpp::Time using the same clock
-// source ROS2 uses by default (system clock). If your kernel reports
-// CLOCK_MONOTONIC timestamps (common for UVC/V4L2 drivers) and you need
-// alignment with other MONOTONIC-based timestamps, adapt this function
-// accordingly and document the choice -- do not silently mix clock bases.
-rclcpp::Time v4l2_timestamp_to_ros(const struct timeval & tv)
-{
-  int64_t nanoseconds =
-    static_cast<int64_t>(tv.tv_sec) * 1000000000LL +
-    static_cast<int64_t>(tv.tv_usec) * 1000LL;
-  return rclcpp::Time(nanoseconds, RCL_STEADY_TIME);
-}
 
 }  // namespace
 
@@ -279,9 +265,25 @@ private:
 
       ++frame_count;
 
+      // ---- Software timestamp — stamp immediately after DQBUF returns ----
+      // No longer use buf.timestamp (RTCPU domain) + offset correction. On JP6.2, this
+      // offset has been reported by multiple developers to be unreliable (second-level
+      // error, continuous drift), and cannot be used as a basis for precise correction.
+      // Use ROS2's own clock instead (this->get_clock()->now(), CLOCK_MONOTONIC domain),
+      // so that the publisher and subscriber sides remain in the same clock domain
+      // throughout, with no need for any cross-domain offset.
+      //
+      // Cost: This timestamp lags the actual hardware SOF instant by the fixed delay of
+      // "exposure + readout + RTCPU processing + driver notification" (the exact value
+      // depends on the sensor/driver, but is essentially constant for the same camera).
+      // Benefit: This fixed delay is present equally in the baseline and in future NITROS
+      // comparison experiments, so it cancels out automatically in difference comparisons
+      // — and that is exactly the number we really want to see.
+      const rclcpp::Time capture_time = capture_clock_.now();
+
       // ---- Intentional CPU copy (this is the baseline's defining trait) ----
       auto msg = std::make_unique<sensor_msgs::msg::Image>();
-      msg->header.stamp = v4l2_timestamp_to_ros(buf.timestamp);
+      msg->header.stamp = capture_time;
       msg->header.frame_id = "camera";
       msg->height = height_;
       msg->width = width_;
@@ -325,6 +327,7 @@ private:
   uint32_t image_size_ = 0;
   bool streaming_;
   std::vector<MmapBuffer> buffers_;
+  rclcpp::Clock capture_clock_{RCL_STEADY_TIME};
 
   // ROS2 state
   std::string topic_name_;

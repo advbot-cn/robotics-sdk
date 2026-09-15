@@ -35,6 +35,9 @@
 #include <vector>
 #include <thread>
 #include <atomic>
+#include <algorithm>
+#include <cmath>
+#include <limits>
 
 namespace
 {
@@ -43,6 +46,72 @@ struct MmapBuffer
 {
   void * start = nullptr;
   size_t length = 0;
+};
+
+struct TimingStats {
+  uint64_t count = 0;
+  int64_t sum_ns = 0;
+  double sum_sq_ns2 = 0.0;
+  int64_t min_ns = std::numeric_limits<int64_t>::max();
+  int64_t max_ns = std::numeric_limits<int64_t>::min();
+
+  void add(int64_t ns) {
+    ++count;
+    sum_ns += ns;
+    sum_sq_ns2 += static_cast<double>(ns) * ns;
+    min_ns = std::min(min_ns, ns);
+    max_ns = std::max(max_ns, ns);
+  }
+  double avg_ms() const
+  {
+    if (count == 0) {
+      return 0.0;
+    }
+
+    return static_cast<double>(sum_ns) / count / 1e6;
+  }
+
+  double stddev_ms() const
+  {
+    if (count <= 1) {
+      return 0.0;
+    }
+
+    const double mean_ns =
+      static_cast<double>(sum_ns) / static_cast<double>(count);
+
+    const double variance_ns2 =
+      (sum_sq_ns2 / static_cast<double>(count)) -
+      (mean_ns * mean_ns);
+
+    return std::sqrt(std::max(0.0, variance_ns2)) / 1e6;
+  }
+
+  double min_ms() const
+  {
+    if (count == 0) {
+      return 0.0;
+    }
+
+    return static_cast<double>(min_ns) / 1e6;
+  }
+
+  double max_ms() const
+  {
+    if (count == 0) {
+      return 0.0;
+    }
+
+    return static_cast<double>(max_ns) / 1e6;
+  }
+  void reset()
+  {
+    count = 0;
+    sum_ns = 0;
+    sum_sq_ns2 = 0.0;
+    min_ns = std::numeric_limits<int64_t>::max();
+    max_ns = std::numeric_limits<int64_t>::min();
+  }
 };
 
 }  // namespace
@@ -66,6 +135,7 @@ public:
     buffer_count_ = this->declare_parameter<int>("buffer_count", 4);
     topic_name_ = this->declare_parameter<std::string>("topic", "camera/image_raw");
 
+	enable_detailed_timing_ = 1;
     RCLCPP_INFO(
       this->get_logger(),
       "Opening %s (%dx%d @ %d fps requested, %d mmap buffers)",
@@ -282,6 +352,7 @@ private:
       const rclcpp::Time capture_time = capture_clock_.now();
 
       // ---- Intentional CPU copy (this is the baseline's defining trait) ----
+      auto t_alloc_start = capture_clock_.now();
       auto msg = std::make_unique<sensor_msgs::msg::Image>();
       msg->header.stamp = capture_time;
       msg->header.frame_id = "camera";
@@ -293,13 +364,31 @@ private:
 
       const size_t bytes_to_copy = buf.bytesused > 0 ? buf.bytesused : image_size_;
       msg->data.resize(bytes_to_copy);
-      std::memcpy(
-        msg->data.data(),
-        buffers_[buf.index].start,
-        bytes_to_copy);
-      // ---- End of the copy we intend to measure / later remove ----
+      auto t_alloc_end = capture_clock_.now();
+      alloc_stats_.add((t_alloc_end - t_alloc_start).nanoseconds());
+  
+      if (enable_detailed_timing_) {
+      		auto t_copy_start = t_alloc_end;
+      		std::memcpy(
+        	msg->data.data(),
+        	buffers_[buf.index].start,
+        	bytes_to_copy);
+      		auto t_copy_end = capture_clock_.now();
+      		copy_stats_.add((t_copy_end - t_copy_start).nanoseconds());
+      		// ---- End of the copy we intend to measure / later remove ----
 
-      publisher_->publish(std::move(msg));
+     		auto t_publish_start = t_copy_end;
+      		publisher_->publish(std::move(msg));
+      		auto t_publish_end = capture_clock_.now();
+      		publish_stats_.add((t_publish_end - t_publish_start).nanoseconds());
+      }else{
+	      std::memcpy(
+	        msg->data.data(),
+	        buffers_[buf.index].start,
+	        bytes_to_copy);
+	      // ---- End of the copy we intend to measure / later remove ----
+	      publisher_->publish(std::move(msg));
+      }
       ++publish_count;
 
       if (ioctl(fd_, VIDIOC_QBUF, &buf) < 0) {
@@ -312,6 +401,31 @@ private:
           this->get_logger(), "frames captured=%lu published=%lu",
           static_cast<unsigned long>(frame_count),
           static_cast<unsigned long>(publish_count));
+        if (enable_detailed_timing_) {
+        	RCLCPP_INFO(
+          		this->get_logger(),
+          		"  alloc:   min=%.3f ms avg=%.3f ms max=%.3f ms stddev=%.3f ms",
+          		alloc_stats_.min_ms(),
+          		alloc_stats_.avg_ms(),
+          		alloc_stats_.max_ms(),
+          		alloc_stats_.stddev_ms());
+
+        		RCLCPP_INFO(
+          		this->get_logger(),
+          		"  memcpy:  min=%.3f ms avg=%.3f ms max=%.3f ms stddev=%.3f ms",
+          		copy_stats_.min_ms(),
+          		copy_stats_.avg_ms(),
+          		copy_stats_.max_ms(),
+          		copy_stats_.stddev_ms());
+
+        		RCLCPP_INFO(
+          		this->get_logger(),
+          		"  publish: min=%.3f ms avg=%.3f ms max=%.3f ms stddev=%.3f ms",
+          		publish_stats_.min_ms(),
+          		publish_stats_.avg_ms(),
+          		publish_stats_.max_ms(),
+          		publish_stats_.stddev_ms());
+       	}
       }
     }
   }
@@ -334,6 +448,10 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr publisher_;
   std::thread capture_thread_;
   std::atomic<bool> running_;
+  
+  //time stats
+  int enable_detailed_timing_; 
+  TimingStats alloc_stats_, copy_stats_, publish_stats_;
 };
 
 int main(int argc, char ** argv)

@@ -2,40 +2,55 @@
 //
 // Windowed measurement node for the camera baseline. Every `report_every_n`
 // frames it closes out a measurement window and emits one row of stats
-// (to the console log, and optionally to a CSV file) covering:
+// (console log, and optionally CSV) covering:
 //
-//   - fps (from window monotonic-clock duration, not just period average)
-//   - end-to-end latency (steady_now - header.stamp): min/avg/max
+//   - fps (from window steady-clock duration)
+//   - pipeline_latency (steady_now - header.stamp): min/avg/max/stddev
+//       This is the TOTAL latency from camera_node's post-DQBUF software
+//       timestamp to this subscriber's callback execution. See
+//       camera_node.cpp / README for why header.stamp is a software
+//       timestamp, not the camera's true hardware SOF time.
+//   - wire_transport (rmw received_timestamp - rmw source_timestamp):
+//       the portion of pipeline_latency spent in DDS/RTPS transport itself
+//       (serialization already happened before source_timestamp is
+//       recorded on the publish side, so this is transport-only, not
+//       serialize+transport).
+//   - executor_dispatch (steady_now - rmw received_timestamp):
+//       the portion spent queued, waiting for this node's executor to
+//       actually invoke the callback after the message physically arrived.
+//       This is the term expected to grow with multiple concurrent
+//       subscriptions/nodes sharing one executor (multi-camera scaling).
+//   - period (inter-arrival gap): min/avg/max/stddev, and suspected-drop
+//       heuristic (gap > 1.5x expected period)
 //   - bandwidth: bytes/sec over the window (mirrors `ros2 topic bw`)
-//   - suspected drops within the window
 //
-// This node is meant to run ALONGSIDE, not replace, the following
-// independent verifications (see README "Recording a full baseline
-// snapshot"):
-//   - `ros2 topic hz <topic> --window 200`  (cross-check against this
-//     node's own fps/stddev numbers)
-//   - `ros2 topic bw <topic>`               (cross-check bandwidth)
-//   - `tegrastats`                          (system-level CPU/GPU/power -
-//     this is out of scope for a ROS2 node and should stay a separate tool)
-//   - `nvpmodel -q` / `jetson_clocks --show` (confirms DVFS is locked
-//     BEFORE the run; this node cannot verify or control that)
+// IMPORTANT: source_timestamp/received_timestamp come from the RMW layer
+// (rmw_message_info_t), not from this node's own code. They have been
+// unreliable/zero on some RMW implementations and ROS2 versions in the
+// past. This node validates them every window (non-zero, received >=
+// source) and reports how many samples were rejected -- do not trust
+// wire_transport/executor_dispatch numbers if invalid_timestamp_count is
+// a large fraction of window_frame_count.
+//
+// This node is meant to run ALONGSIDE, not replace, independent
+// verification tools (see README "Recording a full baseline snapshot"):
+// `ros2 topic hz`, `ros2 topic bw`, `tegrastats`, `nvpmodel -q` /
+// `jetson_clocks --show`.
 //
 // Drop detection remains a heuristic (see camera_node.cpp / README):
 // sensor_msgs/Image has no sequence number in ROS2, so "suspected_drops"
-// is inferred from inter-arrival gaps exceeding 1.5x the expected period,
-// not a ground-truth count. Cross-check against camera_node's own
-// captured/published counters for the real picture.
+// is inferred from inter-arrival gaps, not a ground-truth count.
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <adv_gmsl_camera_baseline/timing_stats.hpp>
 
 #include <cstdint>
-#include <cmath>
-#include <limits>
 #include <fstream>
 #include <chrono>
 #include <iomanip>
 #include <sstream>
+#include <string>
 
 namespace
 {
@@ -72,7 +87,13 @@ public:
       } else {
         csv_file_
           << "wall_time,window_frame_count,avg_fps,"
-          << "latency_min_ms,latency_avg_ms,latency_max_ms,"
+          << "pipeline_latency_min_ms,pipeline_latency_avg_ms,"
+          << "pipeline_latency_max_ms,pipeline_latency_stddev_ms,"
+          << "wire_transport_min_ms,wire_transport_avg_ms,"
+          << "wire_transport_max_ms,wire_transport_stddev_ms,"
+          << "executor_dispatch_min_ms,executor_dispatch_avg_ms,"
+          << "executor_dispatch_max_ms,executor_dispatch_stddev_ms,"
+          << "invalid_timestamp_count,"
           << "period_min_ms,period_avg_ms,period_max_ms,period_stddev_ms,"
           << "bandwidth_MBps,suspected_drops_in_window,"
           << "cumulative_received,cumulative_suspected_drops\n";
@@ -88,7 +109,9 @@ public:
     auto qos = rclcpp::SensorDataQoS();
     subscription_ = this->create_subscription<sensor_msgs::msg::Image>(
       topic_name_, qos,
-      std::bind(&BenchmarkSubscriber::on_image, this, std::placeholders::_1));
+      std::bind(
+        &BenchmarkSubscriber::on_image, this,
+        std::placeholders::_1, std::placeholders::_2));
 
     RCLCPP_INFO(
       this->get_logger(),
@@ -129,22 +152,18 @@ private:
     window_frame_count_ = 0;
     window_start_time_ = steady_clock_.now();
     window_bytes_ = 0;
-
-    window_min_period_ns_ = std::numeric_limits<int64_t>::max();
-    window_max_period_ns_ = std::numeric_limits<int64_t>::min();
-    window_period_sum_ms_ = 0.0;
-    window_period_sq_sum_ = 0.0;  // for stddev, in (ms)^2
-    window_period_samples_ = 0;
-
-    window_min_latency_ns_ = std::numeric_limits<int64_t>::max();
-    window_max_latency_ns_ = std::numeric_limits<int64_t>::min();
-    window_latency_sum_ns_ = 0;
-    window_latency_samples_ = 0;
-
+    window_invalid_timestamp_count_ = 0;
     window_suspected_drops_ = 0;
+
+    pipeline_latency_stats_.reset();
+    wire_transport_stats_.reset();
+    executor_dispatch_stats_.reset();
+    period_stats_.reset();
   }
 
-  void on_image(const sensor_msgs::msg::Image::SharedPtr msg)
+  void on_image(
+    const sensor_msgs::msg::Image::SharedPtr msg,
+    const rclcpp::MessageInfo & info)
   {
     const rclcpp::Time now = steady_clock_.now();
 
@@ -152,32 +171,60 @@ private:
     ++window_frame_count_;
     window_bytes_ += msg->data.size();
 
-    // ---- Latency: T_now - T0 ----
+    // ---- Total pipeline latency: T_now - T0 (camera_node's post-DQBUF stamp) ----
     const rclcpp::Time stamp(msg->header.stamp, RCL_STEADY_TIME);
-    int64_t latency_ns = (now - stamp).nanoseconds();
-    if (latency_ns < 0) {
+    int64_t pipeline_latency_ns = (now - stamp).nanoseconds();
+    if (pipeline_latency_ns < 0) {
       RCLCPP_WARN_THROTTLE(
         this->get_logger(), steady_clock_, 5000,
-        "Negative latency (%ld ns) - check clock source consistency between "
-        "camera_node and this subscriber.",
-        static_cast<long>(latency_ns));
+        "Negative pipeline latency (%ld ns) - check clock source consistency "
+        "between camera_node and this subscriber.",
+        static_cast<long>(pipeline_latency_ns));
     } else {
-      window_latency_sum_ns_ += latency_ns;
-      window_min_latency_ns_ = std::min(window_min_latency_ns_, latency_ns);
-      window_max_latency_ns_ = std::max(window_max_latency_ns_, latency_ns);
-      ++window_latency_samples_;
+      pipeline_latency_stats_.add(pipeline_latency_ns);
+    }
+
+    // ---- Breakdown: wire transport + executor dispatch, from RMW timestamps ----
+    // These come from the middleware, not our own code -- validate before use.
+    const rmw_message_info_t & rmw_info = info.get_rmw_message_info();
+    const int64_t source_ts_ns = rmw_info.source_timestamp;
+    const int64_t received_ts_ns = rmw_info.received_timestamp;
+
+    const bool timestamps_valid =
+      source_ts_ns != 0 && received_ts_ns != 0 && received_ts_ns >= source_ts_ns;
+
+    if (!timestamps_valid) {
+      ++window_invalid_timestamp_count_;
+      RCLCPP_WARN_THROTTLE(
+        this->get_logger(), steady_clock_, 5000,
+        "Invalid RMW timestamps this sample (source=%ld received=%ld) - "
+        "wire_transport/executor_dispatch breakdown unavailable for this "
+        "frame. If this happens frequently, do not trust the breakdown "
+        "columns for this run; fall back to pipeline_latency only.",
+        static_cast<long>(source_ts_ns), static_cast<long>(received_ts_ns));
+    } else {
+      const int64_t wire_transport_ns = received_ts_ns - source_ts_ns;
+      const int64_t executor_dispatch_ns = system_clock_.now().nanoseconds() - received_ts_ns;
+
+      wire_transport_stats_.add(wire_transport_ns);
+      // executor_dispatch should not be negative either (received happens
+      // before the callback runs, by definition) -- guard the same way.
+      if (executor_dispatch_ns < 0) {
+        RCLCPP_WARN_THROTTLE(
+          this->get_logger(), steady_clock_, 5000,
+          "Negative executor_dispatch (%ld ns) computed from RMW "
+          "received_timestamp - treating this sample's breakdown as invalid.",
+          static_cast<long>(executor_dispatch_ns));
+        ++window_invalid_timestamp_count_;
+      } else {
+	executor_dispatch_stats_.add(executor_dispatch_ns);
+      }
     }
 
     // ---- Inter-arrival period / suspected drop detection ----
     if (has_previous_arrival_) {
       int64_t period_ns = (now - previous_arrival_).nanoseconds();
-      double period_ms = static_cast<double>(period_ns) / 1e6;
-
-      window_period_sum_ms_ += period_ms;
-      window_period_sq_sum_ += period_ms * period_ms;
-      window_min_period_ns_ = std::min(window_min_period_ns_, period_ns);
-      window_max_period_ns_ = std::max(window_max_period_ns_, period_ns);
-      ++window_period_samples_;
+      period_stats_.add(period_ns);
 
       if (period_ns > drop_threshold_ns_) {
         ++window_suspected_drops_;
@@ -185,7 +232,8 @@ private:
         RCLCPP_WARN(
           this->get_logger(),
           "Suspected drop: gap=%.2f ms (> 1.5x expected %.2f ms)",
-          period_ms, static_cast<double>(expected_period_ns_) / 1e6);
+          static_cast<double>(period_ns) / 1e6,
+          static_cast<double>(expected_period_ns_) / 1e6);
       }
     }
     previous_arrival_ = now;
@@ -206,45 +254,60 @@ private:
     double bandwidth_MBps = (window_duration_s > 0.0)
       ? (window_bytes_ / window_duration_s) / (1024.0 * 1024.0) : 0.0;
 
-    double period_avg_ms = (window_period_samples_ > 0)
-      ? window_period_sum_ms_ / window_period_samples_ : 0.0;
-    double period_variance = (window_period_samples_ > 0)
-      ? (window_period_sq_sum_ / window_period_samples_) - (period_avg_ms * period_avg_ms)
-      : 0.0;
-    double period_stddev_ms = (period_variance > 0.0) ? std::sqrt(period_variance) : 0.0;
-
-    double latency_avg_ms = (window_latency_samples_ > 0)
-      ? (static_cast<double>(window_latency_sum_ns_) / window_latency_samples_) / 1e6 : 0.0;
-    double latency_min_ms = (window_min_latency_ns_ == std::numeric_limits<int64_t>::max())
-      ? 0.0 : static_cast<double>(window_min_latency_ns_) / 1e6;
-    double latency_max_ms = (window_max_latency_ns_ == std::numeric_limits<int64_t>::min())
-      ? 0.0 : static_cast<double>(window_max_latency_ns_) / 1e6;
-    double period_min_ms = (window_min_period_ns_ == std::numeric_limits<int64_t>::max())
-      ? 0.0 : static_cast<double>(window_min_period_ns_) / 1e6;
-    double period_max_ms = (window_max_period_ns_ == std::numeric_limits<int64_t>::min())
-      ? 0.0 : static_cast<double>(window_max_period_ns_) / 1e6;
-
     RCLCPP_INFO(
       this->get_logger(),
-      "n=%d fps=%.2f | latency(min/avg/max)=%.2f/%.2f/%.2fms | "
+      "n=%d fps=%.2f | "
+      "pipeline_latency(min/avg/max/std)=%.2f/%.2f/%.2f/%.2fms | "
+      "wire_transport(avg/std)=%.3f/%.3fms | "
+      "executor_dispatch(avg/std)=%.3f/%.3fms | "
       "period(min/avg/max/std)=%.2f/%.2f/%.2f/%.2fms | "
-      "bw=%.2fMB/s | drops_in_window=%lu | cumulative_recv=%lu drops=%lu",
+      "bw=%.2fMB/s | drops_in_window=%lu | invalid_ts=%lu | "
+      "cumulative_recv=%lu drops=%lu",
       window_frame_count_, avg_fps,
-      latency_min_ms, latency_avg_ms, latency_max_ms,
-      period_min_ms, period_avg_ms, period_max_ms, period_stddev_ms,
+      pipeline_latency_stats_.min_ms(), pipeline_latency_stats_.avg_ms(),
+      pipeline_latency_stats_.max_ms(), pipeline_latency_stats_.stddev_ms(),
+      wire_transport_stats_.avg_ms(), wire_transport_stats_.stddev_ms(),
+      executor_dispatch_stats_.avg_ms(), executor_dispatch_stats_.stddev_ms(),
+      period_stats_.min_ms(), period_stats_.avg_ms(),
+      period_stats_.max_ms(), period_stats_.stddev_ms(),
       bandwidth_MBps,
       static_cast<unsigned long>(window_suspected_drops_),
+      static_cast<unsigned long>(window_invalid_timestamp_count_),
       static_cast<unsigned long>(cumulative_received_),
       static_cast<unsigned long>(cumulative_suspected_drops_));
+
+    if (window_invalid_timestamp_count_ > 0) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "%lu/%d samples in this window had invalid RMW timestamps -- "
+        "wire_transport/executor_dispatch numbers above are computed from "
+        "the remaining valid samples only, not all %d frames.",
+        static_cast<unsigned long>(window_invalid_timestamp_count_),
+        window_frame_count_, window_frame_count_);
+    }
 
     if (csv_file_.is_open()) {
       csv_file_
         << now_iso8601() << ","
         << window_frame_count_ << ","
         << avg_fps << ","
-        << latency_min_ms << "," << latency_avg_ms << "," << latency_max_ms << ","
-        << period_min_ms << "," << period_avg_ms << "," << period_max_ms << ","
-        << period_stddev_ms << ","
+        << pipeline_latency_stats_.min_ms() << ","
+        << pipeline_latency_stats_.avg_ms() << ","
+        << pipeline_latency_stats_.max_ms() << ","
+        << pipeline_latency_stats_.stddev_ms() << ","
+        << wire_transport_stats_.min_ms() << ","
+        << wire_transport_stats_.avg_ms() << ","
+        << wire_transport_stats_.max_ms() << ","
+        << wire_transport_stats_.stddev_ms() << ","
+        << executor_dispatch_stats_.min_ms() << ","
+        << executor_dispatch_stats_.avg_ms() << ","
+        << executor_dispatch_stats_.max_ms() << ","
+        << executor_dispatch_stats_.stddev_ms() << ","
+        << window_invalid_timestamp_count_ << ","
+        << period_stats_.min_ms() << ","
+        << period_stats_.avg_ms() << ","
+        << period_stats_.max_ms() << ","
+        << period_stats_.stddev_ms() << ","
         << bandwidth_MBps << ","
         << window_suspected_drops_ << ","
         << cumulative_received_ << ","
@@ -263,8 +326,9 @@ private:
   std::ofstream csv_file_;
 
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr subscription_;
-
   rclcpp::Clock steady_clock_{RCL_STEADY_TIME};
+  rclcpp::Clock system_clock_{RCL_SYSTEM_TIME};
+
   // Cumulative (whole run)
   uint64_t cumulative_received_;
   uint64_t cumulative_suspected_drops_;
@@ -277,19 +341,13 @@ private:
   int window_frame_count_;
   rclcpp::Time window_start_time_;
   uint64_t window_bytes_;
-
-  int64_t window_min_period_ns_;
-  int64_t window_max_period_ns_;
-  double window_period_sum_ms_;
-  double window_period_sq_sum_;   // sum of squares, ms^2, for stddev
-  int window_period_samples_;
-
-  int64_t window_min_latency_ns_;
-  int64_t window_max_latency_ns_;
-  int64_t window_latency_sum_ns_;
-  int window_latency_samples_;
-
+  uint64_t window_invalid_timestamp_count_;
   uint64_t window_suspected_drops_;
+
+  adv_gmsl_camera_baseline::TimingStats pipeline_latency_stats_;
+  adv_gmsl_camera_baseline::TimingStats wire_transport_stats_;
+  adv_gmsl_camera_baseline::TimingStats executor_dispatch_stats_;
+  adv_gmsl_camera_baseline::TimingStats period_stats_;
 };
 
 int main(int argc, char ** argv)

@@ -16,6 +16,13 @@ ament_target_dependencies(camera_node rclcpp sensor_msgs)
 add_executable(benchmark_subscriber src/benchmark_subscriber.cpp)
 ament_target_dependencies(benchmark_subscriber rclcpp sensor_msgs)
 
+target_include_directories(camera_node PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+target_include_directories(benchmark_subscriber PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+
 install(TARGETS
   camera_node
   benchmark_subscriber

@@ -22,6 +22,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/image_encodings.hpp>
+#include <adv_gmsl_camera_baseline/timing_stats.hpp>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -46,72 +47,6 @@ struct MmapBuffer
 {
   void * start = nullptr;
   size_t length = 0;
-};
-
-struct TimingStats {
-  uint64_t count = 0;
-  int64_t sum_ns = 0;
-  double sum_sq_ns2 = 0.0;
-  int64_t min_ns = std::numeric_limits<int64_t>::max();
-  int64_t max_ns = std::numeric_limits<int64_t>::min();
-
-  void add(int64_t ns) {
-    ++count;
-    sum_ns += ns;
-    sum_sq_ns2 += static_cast<double>(ns) * ns;
-    min_ns = std::min(min_ns, ns);
-    max_ns = std::max(max_ns, ns);
-  }
-  double avg_ms() const
-  {
-    if (count == 0) {
-      return 0.0;
-    }
-
-    return static_cast<double>(sum_ns) / count / 1e6;
-  }
-
-  double stddev_ms() const
-  {
-    if (count <= 1) {
-      return 0.0;
-    }
-
-    const double mean_ns =
-      static_cast<double>(sum_ns) / static_cast<double>(count);
-
-    const double variance_ns2 =
-      (sum_sq_ns2 / static_cast<double>(count)) -
-      (mean_ns * mean_ns);
-
-    return std::sqrt(std::max(0.0, variance_ns2)) / 1e6;
-  }
-
-  double min_ms() const
-  {
-    if (count == 0) {
-      return 0.0;
-    }
-
-    return static_cast<double>(min_ns) / 1e6;
-  }
-
-  double max_ms() const
-  {
-    if (count == 0) {
-      return 0.0;
-    }
-
-    return static_cast<double>(max_ns) / 1e6;
-  }
-  void reset()
-  {
-    count = 0;
-    sum_ns = 0;
-    sum_sq_ns2 = 0.0;
-    min_ns = std::numeric_limits<int64_t>::max();
-    max_ns = std::numeric_limits<int64_t>::min();
-  }
 };
 
 }  // namespace
@@ -451,7 +386,7 @@ private:
   
   //time stats
   int enable_detailed_timing_; 
-  TimingStats alloc_stats_, copy_stats_, publish_stats_;
+  adv_gmsl_camera_baseline::TimingStats alloc_stats_, copy_stats_, publish_stats_;
 };
 
 int main(int argc, char ** argv)

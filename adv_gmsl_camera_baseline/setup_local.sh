@@ -19,8 +19,14 @@ else
     log "WARNING: jetson_clocks not found, skipping."
 fi
 
+v4l2-ctl -d /dev/video0 -c sensor_mode=1,trig_pin=0xffff0007
+v4l2-ctl -d /dev/video1 -c sensor_mode=1,trig_pin=0xffff0007
 v4l2-ctl -d /dev/video2 -c sensor_mode=1,trig_pin=0xffff0007
-
+v4l2-ctl -d /dev/video3 -c sensor_mode=3,trig_pin=0xffff0007
+v4l2-ctl -d /dev/video4 -c sensor_mode=4,trig_pin=0xffff0007
+v4l2-ctl -d /dev/video5 -c sensor_mode=1,trig_pin=0xffff0007
+v4l2-ctl -d /dev/video6 -c sensor_mode=1,trig_pin=0xffff0007
+v4l2-ctl -d /dev/video7 -c sensor_mode=1,trig_pin=0xffff0007
 
 RESULT_DIR="${RESULT_DIR:-${ISAAC_ROS_WS}/baseline_results}"
 ENV_LOG="${RESULT_DIR}/environment.log"
